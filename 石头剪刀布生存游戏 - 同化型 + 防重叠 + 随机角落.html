@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>石头剪刀布生存游戏 - 同化型 + 防重叠 + 随机角落</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: white;
+            overflow: hidden;
+            font-family: Arial, sans-serif;
+        }
+        
+        #setupPanel {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background-color: rgba(255, 255, 255, 0.9);
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.2);
+            text-align: center;
+            z-index: 100;
+        }
+        
+        #gameCanvas {
+            display: block;
+            background-color: white;
+        }
+        
+        #infoPanel {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background-color: rgba(255, 255, 255, 0.8);
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        
+        #controls {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background-color: rgba(255, 255, 255, 0.8);
+            padding: 10px;
+            border-radius: 5px;
+        }
+        
+        button {
+            margin: 5px;
+            padding: 5px 10px;
+            cursor: pointer;
+        }
+        
+        input, select {
+            margin: 5px;
+            padding: 5px;
+        }
+        
+        label {
+            display: block;
+            margin: 10px 0 5px 0;
+        }
+        
+        .hidden {
+            display: none;
+        }
+
+        #winMessage {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 48px;
+            font-weight: bold;
+            text-align: center;
+            opacity: 0;
+            pointer-events: none;
+            z-index: 200;
+        }
+    </style>
+</head>
+<body>
+    <div id="setupPanel">
+        <h2>石头剪刀布生存游戏 - 同化型</h2>
+        <label for="entityCount">每种类型数量（建议10-60）:</label>
+        <input type="number" id="entityCount" min="5" max="100" value="25">
+
+        <label for="gameMode">游戏模式:</label>
+        <select id="gameMode">
+            <option value="open">开放区域（动态边界）</option>
+            <option value="maze">迷宫模式（不可穿墙）</option>
+        </select>
+        
+        <br><br>
+        <button id="startButton">开始游戏</button>
+    </div>
+    
+    <canvas id="gameCanvas"></canvas>
+    
+    <div id="infoPanel" class="hidden">
+        <div>石头: <span id="rockCount">0</span></div>
+        <div>剪刀: <span id="scissorsCount">0</span></div>
+        <div>布: <span id="paperCount">0</span></div>
+        <div>边界大小: <span id="boundarySize">100%</span></div>
+    </div>
+    
+    <div id="controls" class="hidden">
+        <button id="resetButton">重置游戏</button>
+        <button id="pauseButton">暂停/继续</button>
+        <div>速度: <input type="range" id="speedSlider" min="1" max="10" value="5"></div>
+    </div>
+
+    <div id="winMessage" class="hidden"></div>
+
+    <script>
+        // 游戏元素
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        // 类型定义
+        const TYPES = {
+            ROCK: { emoji: '💎', color: '#FF6B6B', prey: 'SCISSORS', predator: 'PAPER' },
+            SCISSORS: { emoji: '✂️', color: '#4ECDC4', prey: 'PAPER', predator: 'ROCK' },
+            PAPER: { emoji: '📜', color: '#45B7D1', prey: 'ROCK', predator: 'SCISSORS' }
+        };
+
+        // 游戏状态
+        let entities = [];
+        let paused = false;
+        let gameSpeed = 5;
+        let gameMode = 'open';
+        let mazeWalls = [];
+        let boundaryWidth = canvas.width;
+        let boundaryHeight = canvas.height;
+        let winState = null;
+
+        const MIN_FRIEND_DISTANCE = 22;
+        const REPULSION_STRENGTH = 0.8;
+
+        // ——————— 工具函数 ———————
+        function shuffleArray(arr) {
+            for (let i = arr.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [arr[i], arr[j]] = [arr[j], arr[i]];
+            }
+            return arr;
+        }
+
+        function findNearest(entity, targetType, maxDist = 120) {
+            let nearest = null;
+            let minDist = maxDist;
+            for (const other of entities) {
+                if (other === entity || other.type !== targetType) continue;
+                const dx = other.x - entity.x;
+                const dy = other.y - entity.y;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+                if (dist < minDist) {
+                    minDist = dist;
+                    nearest = other;
+                }
+            }
+            return nearest;
+        }
+
+        function getNearbyFriends(entity, maxDist = MIN_FRIEND_DISTANCE + 10) {
+            const friends = [];
+            for (const other of entities) {
+                if (other === entity || other.type !== entity.type) continue;
+                const dx = other.x - entity.x;
+                const dy = other.y - entity.y;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+                if (dist > 0 && dist < maxDist) {
+                    friends.push({ other, dx, dy, dist });
+                }
+            }
+            return friends;
+        }
+
+        function collidesWithWall(x, y, radius) {
+            for (const wall of mazeWalls) {
+                if (
+                    x + radius > wall.x &&
+                    x - radius < wall.x + wall.width &&
+                    y + radius > wall.y &&
+                    y - radius < wall.y + wall.height
+                ) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        function tryMoveDirectly(entity, dx, dy) {
+            const r = entity.size / 2;
+            const newX = entity.x + dx;
+            const newY = entity.y + dy;
+
+            const pad = r + 8;
+            const leftBound = (canvas.width - boundaryWidth) / 2 + pad;
+            const rightBound = leftBound + boundaryWidth - 2 * pad;
+            const topBound = (canvas.height - boundaryHeight) / 2 + pad;
+            const bottomBound = topBound + boundaryHeight - 2 * pad;
+
+            if (newX < leftBound || newX > rightBound || newY < topBound || newY > bottomBound) {
+                return false;
+            }
+
+            if (gameMode === 'maze' && collidesWithWall(newX, newY, r)) {
+                return false;
+            }
+
+            entity.x = newX;
+            entity.y = newY;
+            return true;
+        }
+
+        function tryMove(entity, dx, dy) {
+            if (tryMoveDirectly(entity, dx, dy)) return true;
+            const step = gameSpeed / 5;
+            for (let i = 0; i < 8; i++) {
+                const a = (Math.PI * 2 / 8) * i;
+                if (tryMoveDirectly(entity, Math.cos(a) * step, Math.sin(a) * step)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // ——————— 迷宫生成 ———————
+        function generateMaze(corners) {
+            const wallCount = 30 + Math.floor(Math.random() * 20);
+            const minLen = 40, maxLen = 120, thickness = 10;
+            const safeZones = corners.map(c => ({
+                x1: c.x - 30, y1: c.y - 30,
+                x2: c.x + 90, y2: c.y + 90
+            }));
+
+            function inSafeZone(x, y, w, h) {
+                for (const z of safeZones) {
+                    if (x + w > z.x1 && x < z.x2 && y + h > z.y1 && y < z.y2) return true;
+                }
+                return false;
+            }
+
+            for (let i = 0; i < wallCount; i++) {
+                let placed = false, attempts = 0;
+                while (!placed && attempts < 100) {
+                    const horiz = Math.random() > 0.5;
+                    const len = minLen + Math.random() * (maxLen - minLen);
+                    const w = horiz ? len : thickness;
+                    const h = horiz ? thickness : len;
+                    const x = Math.random() * (canvas.width - w);
+                    const y = Math.random() * (canvas.height - h);
+                    if (!inSafeZone(x, y, w, h)) {
+                        mazeWalls.push({x, y, width: w, height: h});
+                        placed = true;
+                    }
+                    attempts++;
+                }
+            }
+        }
+
+        // ——————— 游戏初始化 ———————
+        function initGame(countPerType) {
+            entities = [];
+            mazeWalls = [];
+            winState = null;
+            paused = false;
+
+            const scale = Math.min(1.0, Math.max(0.5, (countPerType * 3) / 150));
+            boundaryWidth = canvas.width * scale;
+            boundaryHeight = canvas.height * scale;
+
+            // 四个角落
+            const corners = [
+                {x: 20, y: 20},
+                {x: canvas.width - 40, y: 20},
+                {x: 20, y: canvas.height - 40},
+                {x: canvas.width - 40, y: canvas.height - 40}
+            ];
+            const selectedCorners = shuffleArray([...corners]).slice(0, 3);
+            const types = Object.keys(TYPES);
+
+            const leftBound = (canvas.width - boundaryWidth) / 2;
+            const topBound = (canvas.height - boundaryHeight) / 2;
+            const rightBound = leftBound + boundaryWidth;
+            const bottomBound = topBound + boundaryHeight;
+
+            for (let i = 0; i < 3; i++) {
+                const corner = selectedCorners[i];
+                const type = types[i];
+                for (let j = 0; j < countPerType; j++) {
+                    let x = corner.x + Math.random() * 60;
+                    let y = corner.y + Math.random() * 60;
+                    x = Math.max(leftBound + 30, Math.min(x, rightBound - 30));
+                    y = Math.max(topBound + 30, Math.min(y, bottomBound - 30));
+                    entities.push({
+                        x, y,
+                        type,
+                        size: 16,
+                        angle: Math.random() * Math.PI * 2
+                    });
+                }
+            }
+
+            if (gameMode === 'maze') {
+                generateMaze(corners);
+            }
+
+            updateCounts();
+            document.getElementById('winMessage').classList.add('hidden');
+        }
+
+        // ——————— 胜利动画 ———————
+        function triggerWinAnimation(winnerType) {
+            paused = true;
+            winState = { type: winnerType, frame: 0 };
+            const msg = document.getElementById('winMessage');
+            msg.textContent = `🎉 ${TYPES[winnerType].emoji} 获胜！`;
+            msg.style.color = TYPES[winnerType].color;
+            msg.classList.remove('hidden');
+            msg.style.opacity = '0';
+        }
+
+        function runWinAnimation() {
+            if (!winState) return;
+
+            const centerX = canvas.width / 2;
+            const centerY = canvas.height / 2;
+            const maxFrame = 120;
+
+            winState.frame++;
+            const t = Math.min(winState.frame / maxFrame, 1);
+            const ease = 1 - Math.pow(1 - t, 3);
+
+            for (const e of entities) {
+                e.x += (centerX - e.x) * 0.05 * ease;
+                e.y += (centerY - e.y) * 0.05 * ease;
+                e.size = 16 + 24 * ease;
+            }
+
+            const msg = document.getElementById('winMessage');
+            msg.style.opacity = String(ease);
+        }
+
+        // ——————— 主循环 ———————
+        function update() {
+            if (paused && !winState) return;
+
+            if (!winState) {
+                const typesPresent = new Set(entities.map(e => e.type));
+                if (typesPresent.size === 1) {
+                    const winner = Array.from(typesPresent)[0];
+                    triggerWinAnimation(winner);
+                }
+            }
+
+            if (winState) {
+                runWinAnimation();
+                return;
+            }
+
+            for (const e of entities) {
+                const info = TYPES[e.type];
+                let targetAngle = null;
+
+                // 1. 追猎物
+                const prey = findNearest(e, info.prey, 100);
+                if (prey) {
+                    const dx = prey.x - e.x;
+                    const dy = prey.y - e.y;
+                    targetAngle = Math.atan2(dy, dx);
+                } else {
+                    // 2. 躲天敌
+                    const predator = findNearest(e, info.predator, 100);
+                    if (predator) {
+                        const dx = e.x - predator.x;
+                        const dy = e.y - predator.y;
+                        targetAngle = Math.atan2(dy, dx);
+                    } else {
+                        // 3. 靠近同类（但保持距离）
+                        const friend = findNearest(e, e.type, 100);
+                        if (friend && friend !== e) {
+                            const dx = friend.x - e.x;
+                            const dy = friend.y - e.y;
+                            const dist = Math.sqrt(dx*dx + dy*dy);
+                            if (dist > 10) {
+                                targetAngle = Math.atan2(dy, dx);
+                            }
+                        }
+                    }
+                }
+
+                // 4. 检查附近同类是否太近 → 产生排斥
+                let repulsionX = 0, repulsionY = 0;
+                const nearbyFriends = getNearbyFriends(e, MIN_FRIEND_DISTANCE + 15);
+                for (const f of nearbyFriends) {
+                    if (f.dist < MIN_FRIEND_DISTANCE) {
+                        const force = (MIN_FRIEND_DISTANCE - f.dist) / MIN_FRIEND_DISTANCE;
+                        repulsionX += (e.x - f.other.x) * force;
+                        repulsionY += (e.y - f.other.y) * force;
+                    }
+                }
+
+                // 合并目标方向与排斥方向
+                if (targetAngle !== null) {
+                    let moveX = Math.cos(targetAngle);
+                    let moveY = Math.sin(targetAngle);
+
+                    if (repulsionX !== 0 || repulsionY !== 0) {
+                        const repLen = Math.sqrt(repulsionX*repulsionX + repulsionY*repulsionY);
+                        repulsionX /= repLen;
+                        repulsionY /= repLen;
+
+                        moveX = moveX * (1 - REPULSION_STRENGTH) + repulsionX * REPULSION_STRENGTH;
+                        moveY = moveY * (1 - REPULSION_STRENGTH) + repulsionY * REPULSION_STRENGTH;
+                    }
+
+                    e.angle = Math.atan2(moveY, moveX);
+                } else if (repulsionX !== 0 || repulsionY !== 0) {
+                    e.angle = Math.atan2(repulsionY, repulsionX);
+                }
+
+                const step = gameSpeed / 5;
+                const dx = Math.cos(e.angle) * step;
+                const dy = Math.sin(e.angle) * step;
+                tryMove(e, dx, dy);
+            }
+
+            // 同化逻辑
+            for (let i = entities.length - 1; i >= 0; i--) {
+                const e = entities[i];
+                const info = TYPES[e.type];
+                for (let j = 0; j < entities.length; j++) {
+                    if (i === j) continue;
+                    const other = entities[j];
+                    const dx = other.x - e.x;
+                    const dy = other.y - e.y;
+                    const dist = Math.sqrt(dx*dx + dy*dy);
+                    if (dist < e.size) {
+                        if (other.type === info.prey) {
+                            other.type = e.type;
+                        }
+                    }
+                }
+            }
+
+            updateCounts();
+        }
+
+        function updateCounts() {
+            const counts = { ROCK: 0, SCISSORS: 0, PAPER: 0 };
+            for (const e of entities) counts[e.type]++;
+            document.getElementById('rockCount').textContent = counts.ROCK;
+            document.getElementById('scissorsCount').textContent = counts.SCISSORS;
+            document.getElementById('paperCount').textContent = counts.PAPER;
+            document.getElementById('boundarySize').textContent = `${Math.round((boundaryWidth / canvas.width) * 100)}%`;
+        }
+
+        function render() {
+            ctx.fillStyle = 'white';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            const leftBound = (canvas.width - boundaryWidth) / 2;
+            const topBound = (canvas.height - boundaryHeight) / 2;
+            ctx.strokeStyle = 'black';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(leftBound, topBound, boundaryWidth, boundaryHeight);
+
+            if (gameMode === 'maze') {
+                ctx.fillStyle = 'black';
+                for (const wall of mazeWalls) {
+                    ctx.fillRect(wall.x, wall.y, wall.width, wall.height);
+                }
+            }
+
+            for (const e of entities) {
+                const info = TYPES[e.type];
+                ctx.font = `${e.size}px Arial`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillStyle = info.color;
+                ctx.fillText(info.emoji, e.x, e.y);
+            }
+        }
+
+        function gameLoop() {
+            update();
+            render();
+            requestAnimationFrame(gameLoop);
+        }
+
+        // ——————— 全局函数定义 ———————
+        function startGame() {
+            const count = parseInt(document.getElementById('entityCount').value) || 25;
+            gameMode = document.getElementById('gameMode').value;
+            document.getElementById('setupPanel').classList.add('hidden');
+            document.getElementById('infoPanel').classList.remove('hidden');
+            document.getElementById('controls').classList.remove('hidden');
+            initGame(count);
+        }
+
+        function resetGame() {
+            const count = parseInt(document.getElementById('entityCount').value) || 25;
+            gameMode = document.getElementById('gameMode').value;
+            initGame(count);
+        }
+
+        function togglePause() {
+            if (!winState) {
+                paused = !paused;
+            }
+        }
+
+        // ——————— 事件监听器 ———————
+        document.getElementById('startButton').addEventListener('click', startGame);
+        document.getElementById('resetButton').addEventListener('click', resetGame);
+        document.getElementById('pauseButton').addEventListener('click', togglePause);
+        document.getElementById('speedSlider').addEventListener('input', e => {
+            gameSpeed = parseInt(e.target.value);
+        });
+
+        window.addEventListener('resize', () => {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        });
+
+        gameLoop();
+    </script>
+</body>
+</html>
